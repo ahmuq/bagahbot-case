@@ -1,31 +1,42 @@
-import { makeInMemoryStore } from "@rodrigogs/baileys-store";
+import fs from "node:fs";
+
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   areJidsSameUser,
   delay,
   fetchLatestBaileysVersion,
   isPnUser,
   jidNormalizedUser,
+  makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
 import { fileTypeFromBuffer } from "file-type";
 import pino from "pino";
+import qrcode from "qrcode-terminal";
 
 import config from "./config/index.js";
-import { useSQLiteAuthState } from "./database/AuthState.js";
+import SQLiteAuthState from "./database/AuthState.js";
 import Database from "./database/Database.js";
 import CommandHandler from "./handlers/CommandHandler.js";
 import GroupHandler from "./handlers/GroupHandler.js";
 import BagahAPI from "./lib/BagahAPI.js";
 import Exif from "./lib/Exif.js";
-import { getBuffer } from "./utils/helpers.js";
+import Helpers from "./utils/helpers.js";
 import Logger from "./utils/logger.js";
 import Message from "./utils/serializer.js";
 
+const GROUP_CACHE_TTL_MS = 60_000;
+const RECONNECT_DELAY_MS = 3_000;
+const PAIRING_DELAY_MS = 3_000;
+const PHONE_PATTERN = /^\d{10,15}$/;
+const CUSTOM_CODE_PATTERN = /^[A-Z0-9]{8}$/;
+
 export default class BagahBot {
-  constructor() {
+  #groupCache = new Map();
+
+  constructor({ dbPath = "database.db" } = {}) {
     this.sock = null;
-    this.store = null;
-    this.db = new Database("database.db");
+    this.db = new Database(dbPath);
     this.config = config;
     this.exif = new Exif();
     this.api = new BagahAPI(config.api.baseUrl, config.api.key);
@@ -34,43 +45,53 @@ export default class BagahBot {
     this.commandHandler = null;
     this.groupHandler = null;
     this.saveCreds = null;
+    this.initialized = false;
+    this.reconnecting = false;
+    this.usePairing = false;
   }
 
   async start() {
-    Logger.info("Memulai Bagah Bot v2.0.0...");
+    await this.#initialize();
 
-    await this.db.ready();
-    Logger.info("Database siap (database.db)");
+    const authState = await SQLiteAuthState.create("session.db");
+    this.saveCreds = () => authState.saveCreds();
 
     const logger = pino({ level: "silent" });
-    this.store = makeInMemoryStore({});
-
-    const { state, saveCreds } = await useSQLiteAuthState("session.db");
-    this.saveCreds = saveCreds;
-
     const { version } = await fetchLatestBaileysVersion();
     Logger.info(`Baileys version: ${version.join(".")}`);
 
-    const usePairing =
-      this.config.pairing.enabled && this.config.pairing.number;
+    this.usePairing = Boolean(
+      this.config.pairing.enabled && this.config.pairing.number,
+    );
+
     this.sock = makeWASocket({
       logger,
-      printQRInTerminal: !usePairing,
-      browser: ["Mac OS", "Safari", "10.15.7"],
-      auth: state,
       version,
+      browser: Browsers.macOS("Chrome"),
+      auth: {
+        creds: authState.state.creds,
+        keys: makeCacheableSignalKeyStore(authState.state.keys, logger),
+      },
+      cachedGroupMetadata: (jid) => this.getGroupMetadata(jid),
     });
 
-    this.store.bind(this.sock.ev);
+    this.#bindEvents();
+    await this.#handlePairing();
+
+    Logger.info("Menunggu koneksi...");
+  }
+
+  async #initialize() {
+    if (this.initialized) return;
+
+    Logger.info("Memulai Bagah Bot...");
+
+    await this.db.ready();
+    Logger.info(`Database siap (${this.db.dbPath})`);
 
     this.commandHandler = new CommandHandler(this);
     this.groupHandler = new GroupHandler(this);
-
-    this.#bindEvents();
-
-    await this.#handlePairing(usePairing);
-
-    Logger.info("Menunggu koneksi...");
+    this.initialized = true;
   }
 
   #bindEvents() {
@@ -80,29 +101,23 @@ export default class BagahBot {
 
     this.sock.ev.on("creds.update", this.saveCreds);
 
-    this.sock.ev.on("messages.upsert", (chatUpdate) => {
-      this.#onMessage(chatUpdate);
-    });
-
-    this.sock.ev.process(async (events) => {
-      if (events["messages.upsert"]) {
-        await this.#onAutoReadStatus(events["messages.upsert"]);
-      }
-      if (events["creds.update"]) {
-        await this.saveCreds();
-      }
+    this.sock.ev.on("messages.upsert", (upsert) => {
+      this.#onMessagesUpsert(upsert).catch((error) =>
+        Logger.error("Error handling message:", error),
+      );
+      this.#onAutoReadStatus(upsert).catch((error) =>
+        Logger.error("Error reading status:", error),
+      );
     });
 
     this.sock.ev.on("group-participants.update", (event) => {
+      this.#groupCache.delete(event.id);
       this.groupHandler.handle(event);
     });
 
-    this.sock.ev.on("contacts.update", (update) => {
-      for (const contact of update) {
-        const id = this.decodeJid(contact.id);
-        if (this.store?.contacts) {
-          this.store.contacts[id] = { id, name: contact.notify };
-        }
+    this.sock.ev.on("groups.update", (updates) => {
+      for (const update of updates || []) {
+        if (update.id) this.#groupCache.delete(update.id);
       }
     });
 
@@ -112,17 +127,20 @@ export default class BagahBot {
   }
 
   #onConnectionUpdate(update) {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr && !this.usePairing) {
+      Logger.info("Scan QR berikut untuk menghubungkan bot:");
+      qrcode.generate(qr, { small: true });
+    }
 
     if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) {
-        Logger.warn("Koneksi terputus, mencoba reconnect...");
-        this.start();
-      } else {
-        Logger.error("Logged out. Hapus session.db lalu jalankan ulang.");
-      }
-    } else if (connection === "open") {
+      this.#handleDisconnect(lastDisconnect);
+      return;
+    }
+
+    if (connection === "open") {
+      this.reconnecting = false;
       const name =
         this.sock.user?.name || this.sock.user?.verifiedName || "WhatsApp Bot";
       Logger.connection(`Terkoneksi sebagai ${name}`);
@@ -130,42 +148,79 @@ export default class BagahBot {
     }
   }
 
-  async #onMessage(chatUpdate) {
-    try {
-      for (const raw of chatUpdate.messages) {
-        if (!raw.message) continue;
+  #handleDisconnect(lastDisconnect) {
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
 
-        raw.message =
-          Object.keys(raw.message)[0] === "ephemeralMessage"
-            ? raw.message.ephemeralMessage.message
-            : raw.message;
+    if (statusCode === DisconnectReason.loggedOut) {
+      Logger.error("Logged out. Hapus session.db lalu jalankan ulang.");
+      return;
+    }
 
-        if (raw.key?.remoteJid === "status@broadcast") continue;
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    Logger.warn("Koneksi terputus, mencoba reconnect...");
 
-        if (!this.isPublic && !raw.key.fromMe && chatUpdate.type === "notify")
-          continue;
+    delay(RECONNECT_DELAY_MS)
+      .then(() => this.start())
+      .catch((error) => Logger.error("Reconnect gagal:", error))
+      .finally(() => {
+        this.reconnecting = false;
+      });
+  }
 
-        if (raw.key.id?.length === 16 && raw.key.id?.startsWith("3EB0"))
-          continue;
+  async #onMessagesUpsert(upsert) {
+    if (upsert.type !== "notify") return;
 
-        const msg = new Message(this, raw, this.store);
-
-        await this.#checkAntilink(msg);
-
-        const senderPN = this.#toPnJid(msg.sender);
-        if (senderPN?.startsWith("212")) {
-          await this.sock.updateBlockStatus(msg.sender, "block");
-          continue;
-        }
-
-        await this.commandHandler.handle(msg);
+    for (const raw of upsert.messages) {
+      try {
+        await this.#handleMessage(raw);
+      } catch (error) {
+        Logger.error("Error handling message:", error);
       }
-    } catch (err) {
-      Logger.error("Error handling message:", err);
     }
   }
 
+  async #handleMessage(raw) {
+    if (!raw.message) return;
+
+    if (Object.keys(raw.message)[0] === "ephemeralMessage") {
+      raw.message = raw.message.ephemeralMessage?.message;
+    }
+    if (!raw.message) return;
+
+    if (raw.key?.remoteJid === "status@broadcast") return;
+    if (!this.isPublic && !raw.key.fromMe) return;
+    if (this.#isBaileysGeneratedId(raw.key.id)) return;
+
+    const msg = new Message(this, raw);
+
+    if (await this.#isBlockedSender(msg.sender)) {
+      await this.sock.updateBlockStatus(msg.sender, "block");
+      return;
+    }
+
+    await this.#checkAntilink(msg);
+    await this.commandHandler.handle(msg);
+  }
+
+  #isBaileysGeneratedId(id) {
+    return id?.length === 16 && id.startsWith("3EB0");
+  }
+
+  async #isBlockedSender(sender) {
+    const prefixes = this.config.moderation.blockedPrefixes;
+    if (!prefixes.length) return false;
+
+    const phoneNumber = await this.#toPhoneNumber(sender);
+    return Boolean(
+      phoneNumber &&
+        prefixes.some((prefix) => phoneNumber.startsWith(prefix)),
+    );
+  }
+
   async #onAutoReadStatus(upsert) {
+    if (upsert.type !== "notify") return;
+
     for (const msg of upsert.messages) {
       if (msg.key.remoteJid !== "status@broadcast") continue;
       if (msg.message?.protocolMessage) continue;
@@ -175,28 +230,31 @@ export default class BagahBot {
       Logger.info(`Lihat status ${name} (${number})`);
 
       await this.sock.readMessages([msg.key]);
-      await delay(1000);
-      await this.sock.readMessages([msg.key]);
     }
   }
 
   async #checkAntilink(msg) {
     if (!msg.isGroup || msg.fromMe) return;
+    if (!this.db.isAntilink(msg.chat)) return;
 
     const text = msg.body || msg.text || "";
     if (!text.includes("https://") && !text.includes("http://")) return;
 
-    const group = this.db.getGroup(msg.chat);
-    if (!group?.antilink) return;
-
-    const metadata = await this.sock.groupMetadata(msg.chat);
+    const metadata = await this.getGroupMetadata(msg.chat);
     const admins = metadata.participants
-      .filter((v) => v.admin)
-      .map((v) => v.id);
-    if (admins.some((a) => areJidsSameUser(a, msg.sender))) return;
+      .filter((participant) => participant.admin)
+      .map((participant) => participant.id);
+
+    if (
+      msg.senderJids.some((sender) =>
+        admins.some((admin) => areJidsSameUser(admin, sender)),
+      )
+    ) {
+      return;
+    }
 
     const botJid = this.decodeJid(this.sock.user.id);
-    if (!admins.some((a) => areJidsSameUser(a, botJid))) return;
+    if (!admins.some((admin) => areJidsSameUser(admin, botJid))) return;
 
     await this.sock.sendMessage(
       msg.chat,
@@ -209,114 +267,93 @@ export default class BagahBot {
     await this.sock.groupParticipantsUpdate(msg.chat, [msg.sender], "remove");
   }
 
-  async #handlePairing(usePairing) {
-    if (!usePairing || this.sock.authState.creds.registered) return;
+  async #handlePairing() {
+    if (!this.usePairing || this.sock.authState.creds.registered) return;
 
     const phone = String(this.config.pairing.number);
-    const customCode = this.config.pairing.customCode || "";
-
-    if (!/^\d{10,15}$/.test(phone)) {
-      Logger.error("Invalid number, start with country code (Example: 62xxx)");
-      process.exit(1);
+    if (!PHONE_PATTERN.test(phone)) {
+      throw new Error(
+        "Invalid number, start with country code (Example: 62xxx)",
+      );
     }
 
-    await delay(3000);
+    await delay(PAIRING_DELAY_MS);
 
     try {
-      let validatedCode = null;
-      if (customCode) {
-        const cleanCode = customCode
-          .toString()
-          .replace(/[-\s]/g, "")
-          .toUpperCase();
-
-        if (/^[A-Z0-9]{8}$/.test(cleanCode)) {
-          validatedCode = cleanCode;
-          Logger.info(`Using custom pairing code: ${cleanCode}`);
-        } else {
-          Logger.warn(
-            `Invalid custom code (must be 8 alphanumeric chars, got: ${cleanCode}), using random code`,
-          );
-        }
-      }
-
-      let code = await this.sock.requestPairingCode(phone, validatedCode);
-      code = code?.match(/.{1,4}/g)?.join("-") || code;
-      Logger.success(`Your Pairing Code : ${code}`);
-    } catch (err) {
-      Logger.error("Failed to get pairing code", err);
+      const customCode = this.#normalizeCustomCode(
+        this.config.pairing.customCode,
+      );
+      const code = await this.sock.requestPairingCode(phone, customCode);
+      Logger.success(`Your Pairing Code : ${this.#formatPairingCode(code)}`);
+    } catch (error) {
+      Logger.error("Failed to get pairing code", error);
+      this.usePairing = false;
     }
+  }
+
+  #normalizeCustomCode(rawCode) {
+    if (!rawCode) return null;
+
+    const code = String(rawCode).replace(/[-\s]/g, "").toUpperCase();
+    if (CUSTOM_CODE_PATTERN.test(code)) {
+      Logger.info(`Using custom pairing code: ${code}`);
+      return code;
+    }
+
+    Logger.warn(
+      `Invalid custom code (must be 8 alphanumeric chars, got: ${code}), using random code`,
+    );
+    return null;
+  }
+
+  #formatPairingCode(code) {
+    return code?.match(/.{1,4}/g)?.join("-") || code;
+  }
+
+  async getGroupMetadata(jid) {
+    const cached = this.#groupCache.get(jid);
+    if (cached && cached.expiresAt > Date.now()) return cached.metadata;
+
+    const metadata = await this.sock.groupMetadata(jid);
+    this.#groupCache.set(jid, {
+      metadata,
+      expiresAt: Date.now() + GROUP_CACHE_TTL_MS,
+    });
+
+    return metadata;
   }
 
   decodeJid(jid) {
-    if (!jid) return jid;
-    return jidNormalizedUser(jid);
+    return jid ? jidNormalizedUser(jid) : jid;
   }
 
-  #toPnJid(jid) {
+  async #toPhoneNumber(jid) {
     if (!jid) return null;
+
     const normalized = jidNormalizedUser(jid);
     if (isPnUser(normalized)) return normalized.split("@")[0];
+
     try {
-      const pn =
-        this.sock?.signalRepository?.lidMapping?.getPNForLID(normalized);
-      return pn ? pn.split("@")[0] : null;
+      const phoneNumber =
+        await this.sock?.signalRepository?.lidMapping?.getPNForLID(normalized);
+      return phoneNumber ? phoneNumber.split("@")[0] : null;
     } catch {
       return null;
     }
   }
 
   isCreator(sender) {
-    const botNumber = this.decodeJid(this.sock.user.id);
-    const ownerList = [botNumber, ...this.config.bot.ownerJid].map((v) =>
-      jidNormalizedUser(
-        v.includes("@") ? v : v.replace(/[^0-9]/g, "") + "@s.whatsapp.net",
-      ),
+    if (!sender) return false;
+
+    const senderJid = this.decodeJid(sender);
+    const owners = new Set(
+      this.config.bot.ownerJid.map((jid) => this.decodeJid(jid)),
     );
 
-    if (ownerList.includes(sender)) return true;
+    if (this.sock?.user?.id) owners.add(this.decodeJid(this.sock.user.id));
+    if (this.sock?.user?.lid) owners.add(this.decodeJid(this.sock.user.lid));
 
-    return ownerList.some((owner) => areJidsSameUser(owner, sender));
-  }
-
-  async getName(jid) {
-    const id = this.decodeJid(jid);
-
-    if (id.endsWith("@g.us")) {
-      const v =
-        this.store?.contacts?.[id] || (await this.sock.groupMetadata(id)) || {};
-      return v.name || v.subject || id;
-    }
-
-    if (isPnUser(id) && id.startsWith("0")) return "WhatsApp";
-    if (areJidsSameUser(id, this.sock.user.id))
-      return this.sock.user?.name || "Bot";
-
-    const contact = this.store?.contacts?.[id] || {};
-    return contact.name || contact.verifiedName || id.split("@")[0];
-  }
-
-  async sendText(jid, text, quoted) {
-    return this.sock.sendMessage(jid, { text }, { quoted });
-  }
-
-  async sendImage(jid, path, caption = "", quoted) {
-    const buffer = await this.#resolveMedia(path);
-    return this.sock.sendMessage(jid, { image: buffer, caption }, { quoted });
-  }
-
-  async sendVideo(jid, path, caption = "", quoted, gif = false) {
-    const buffer = await this.#resolveMedia(path);
-    return this.sock.sendMessage(
-      jid,
-      { video: buffer, caption, gifPlayback: gif },
-      { quoted },
-    );
-  }
-
-  async sendAudio(jid, path, quoted, ptt = false) {
-    const buffer = await this.#resolveMedia(path);
-    return this.sock.sendMessage(jid, { audio: buffer, ptt }, { quoted });
+    return [...owners].some((owner) => areJidsSameUser(owner, senderJid));
   }
 
   async sendSticker(jid, media, quoted, options = {}) {
@@ -325,59 +362,42 @@ export default class BagahBot {
       mime: "application/octet-stream",
     };
 
-    let stickerPath;
+    let stickerBuffer;
     if (/image\/(jpe?g|png|gif)|octet/.test(mime)) {
-      stickerPath =
+      stickerBuffer =
         options.packname || options.author
           ? await this.exif.writeExifImg(buffer, options)
           : await this.exif.imageToWebp(buffer);
     } else if (/video/.test(mime)) {
-      stickerPath =
+      stickerBuffer =
         options.packname || options.author
           ? await this.exif.writeExifVid(buffer, options)
           : await this.exif.videoToWebp(buffer);
     } else if (/webp/.test(mime)) {
-      stickerPath = await this.exif.writeExifWebp(buffer, options);
+      stickerBuffer = await this.exif.writeExifWebp(buffer, options);
     } else {
       throw new Error(`Unsupported mime type: ${mime}`);
     }
 
-    const stickerData = Buffer.isBuffer(stickerPath)
-      ? stickerPath
-      : { url: stickerPath };
-
     await this.sock.sendPresenceUpdate("composing", jid);
-    return this.sock.sendMessage(jid, { sticker: stickerData }, { quoted });
-  }
-
-  async sendTextWithMentions(jid, text, quoted) {
-    return this.sock.sendMessage(
-      jid,
-      {
-        text,
-        contextInfo: {
-          mentionedJid: [...text.matchAll(/@(\d{0,16})/g)].map(
-            (v) => v[1] + "@s.whatsapp.net",
-          ),
-        },
-      },
-      { quoted },
-    );
+    return this.sock.sendMessage(jid, { sticker: stickerBuffer }, { quoted });
   }
 
   async #resolveMedia(input) {
     if (Buffer.isBuffer(input)) return input;
-    if (typeof input === "object" && input.url) return input;
+
     if (typeof input === "string") {
       if (/^data:.+;base64,/.test(input)) {
         return Buffer.from(input.split(",")[1], "base64");
       }
       if (/^https?:\/\//.test(input)) {
-        return getBuffer(input);
+        return Helpers.getBuffer(input);
       }
-      const fs = await import("node:fs");
-      if (fs.existsSync(input)) return fs.readFileSync(input);
+      if (fs.existsSync(input)) {
+        return fs.readFileSync(input);
+      }
     }
-    return Buffer.alloc(0);
+
+    throw new Error("Unsupported media input");
   }
 }

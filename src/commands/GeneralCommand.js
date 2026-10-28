@@ -1,9 +1,14 @@
-import {
-  formatDate,
-  formatTime,
-  getGreeting,
-  runtime,
-} from "../utils/helpers.js";
+import Helpers from "../utils/helpers.js";
+
+const CATEGORY_TITLES = {
+  general: "MAIN MENU",
+  ai: "AI MENU",
+  maker: "MAKER MENU",
+  group: "GROUP MENU",
+  owner: "OWNER MENU",
+  downloader: "DOWNLOADER MENU",
+  search: "SEARCH MENU",
+};
 
 export default class GeneralCommand {
   constructor(bot) {
@@ -23,95 +28,58 @@ export default class GeneralCommand {
   }
 
   async runtime(msg) {
-    await msg.reply(`BOT AKTIF SELAMA : ${runtime(process.uptime())}`);
+    await msg.reply(
+      `BOT AKTIF SELAMA : ${Helpers.runtime(process.uptime())}`,
+    );
   }
 
   async menu(msg) {
-    const greeting = getGreeting();
-    const time = formatTime();
-    const date = formatDate();
-    const uptime = runtime(process.uptime());
+    const categories = this.bot.commandHandler.getCategories();
+    const text = [
+      `${Helpers.getGreeting()} ${msg.pushName}`,
+      "",
+      "╭──「 *INFO BOT* 」",
+      `│ 🕓 Waktu : ${Helpers.formatTime()} WIB`,
+      `│ 🗓️ Tanggal : ${Helpers.formatDate()}`,
+      `│ ⏱️ Runtime : ${Helpers.runtime(process.uptime())}`,
+      `│ 📦 Version : ${this.bot.config.version}`,
+      "╰────────────",
+      "",
+      ...categories.map(([category, commands]) =>
+        this.#renderSection(category, commands),
+      ),
+      "",
+      `_© ${this.bot.config.bot.name}_`,
+    ].join("\n");
 
-    const text = `${greeting} ${msg.pushName}
-
-╭──「 *INFO BOT* 」
-│ 🕓 Waktu : ${time} WIB
-│ 🗓️ Tanggal : ${date}
-│ ⏱️ Runtime : ${uptime}
-╰────────────
-
-╭──「 *MAIN MENU* 」
-│ ⿻ !runtime
-│ ⿻ !menu
-│ ⿻ !allmenu
-│ ⿻ !groupmenu
-╰────────────
-
-╭──「 *AI MENU* 」
-│ ⿻ !ai
-╰────────────
-
-╭──「 *MAKER MENU* 」
-│ ⿻ !toimg
-│ ⿻ !tts
-│ ⿻ !tourl
-│ ⿻ !sticker / !s / !sgif
-╰────────────
-
-╭──「 *GROUP MENU* 」
-│ ⿻ !gc o/c
-│ ⿻ !promote / !demote
-│ ⿻ !kick / !k
-│ ⿻ !hidetag / !tag
-│ ⿻ !tagall
-│ ⿻ !lgc
-│ ⿻ !antilink
-╰────────────
-
-╭──「 *OWNER MENU* 」
-│ ⿻ !soff / !son
-│ ⿻ !setppbot
-│ ⿻ !addprem / !delprem
-│ ⿻ !listprem
-╰────────────
-
-╭──「 *DOWNLOADER MENU* 」
-│ ⿻ !ttnwm / !ttmp3
-│ ⿻ !fbdl
-│ ⿻ !igdl
-│ ⿻ !igstory
-│ ⿻ !couple
-╰────────────
-
-╭──「 *SEARCH MENU* 」
-│ ⿻ !tiktokstalk
-╰────────────
-
-_© Bagah Bot v2.0.0_`;
-
-    await this.bot.sock.sendMessage(msg.chat, { text }, { quoted: msg.raw });
+    await msg.reply(text);
   }
 
   async groupMenu(msg) {
-    const uptime = runtime(process.uptime());
+    const categories = this.bot.commandHandler
+      .getCategories()
+      .filter(
+        ([category]) => category === "group" || category === "maker",
+      );
+    const text = [
+      `Halo ${msg.pushName}`,
+      "",
+      ...categories.map(([category, commands]) =>
+        this.#renderSection(category, commands),
+      ),
+      "",
+      `Runtime: ${Helpers.runtime(process.uptime())}`,
+      `_© ${this.bot.config.bot.name}_`,
+    ].join("\n");
 
-    const text = `Halo ${msg.pushName}
+    await msg.reply(text);
+  }
 
-╭──「 *GROUP MENU* 」
-│ ⿻ !gc o/c
-│ ⿻ !promote / !demote
-│ ⿻ !kick / !k
-│ ⿻ !add 628xx
-│ ⿻ !hidetag / !tag
-│ ⿻ !tagall
-│ ⿻ !lgc
-│ ⿻ !sticker / !s
-│ ⿻ !toimg
-╰────────────
+  #renderSection(category, commands) {
+    const prefix = this.bot.config.bot.prefix.find(Boolean) || "!";
+    const title = CATEGORY_TITLES[category] || category.toUpperCase();
+    const lines = commands.map((name) => `│ ⿻ ${prefix}${name}`);
 
-Runtime: ${uptime}
-_© Bagah Bot v2.0.0_`;
-
-    await this.bot.sock.sendMessage(msg.chat, { text }, { quoted: msg.raw });
+    return [`╭──「 *${title}* 」`, ...lines, "╰────────────"].join("\n");
   }
 }

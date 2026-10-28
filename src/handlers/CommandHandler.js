@@ -1,3 +1,5 @@
+import util from "node:util";
+
 import AiCommand from "../commands/AiCommand.js";
 import DownloaderCommand from "../commands/DownloaderCommand.js";
 import GeneralCommand from "../commands/GeneralCommand.js";
@@ -6,6 +8,17 @@ import MakerCommand from "../commands/MakerCommand.js";
 import OwnerCommand from "../commands/OwnerCommand.js";
 import SearchCommand from "../commands/SearchCommand.js";
 import Logger from "../utils/logger.js";
+
+const PUNCTUATION_PREFIX = /^[°#*+,.?='():√%!¢£¥€π¤ΠΦ_&`™©®Δ^βα¦|\\/©^-]/;
+const CATEGORY_ORDER = [
+  "general",
+  "ai",
+  "maker",
+  "group",
+  "owner",
+  "downloader",
+  "search",
+];
 
 export default class CommandHandler {
   constructor(bot) {
@@ -25,9 +38,16 @@ export default class CommandHandler {
       new AiCommand(this.bot),
     ];
 
-    for (const mod of modules) {
-      for (const [name, cmd] of mod.commands) {
-        this.commands.set(name, cmd);
+    for (const module of modules) {
+      const moduleName = module.constructor.name;
+
+      for (const [name, command] of module.commands) {
+        if (this.commands.has(name)) {
+          Logger.warn(`Command "${name}" sudah terdaftar, dilewati`);
+          continue;
+        }
+
+        this.commands.set(name, { ...command, module: moduleName });
       }
     }
 
@@ -38,22 +58,42 @@ export default class CommandHandler {
 
   #getPrefix(body) {
     if (!body) return null;
-    const prefixes = this.bot.config.bot.prefix;
 
-    for (const p of prefixes) {
-      if (
-        p === "" &&
-        /^[°#*+,.?=''():√%!¢£¥€π¤ΠΦ_&`™©®Δ^βα¦|/\\©^]/.test(body)
-      ) {
-        const match = body.match(
-          /^[°#*+,.?=''():√%¢£¥€π¤ΠΦ_&!`™©®Δ^βα¦|/\\©^]/gi,
-        );
-        return match ? match[0] : null;
+    for (const prefix of this.bot.config.bot.prefix) {
+      if (prefix === "") {
+        return body.match(PUNCTUATION_PREFIX)?.[0] ?? null;
       }
-      if (p && body.startsWith(p)) return p;
+      if (body.startsWith(prefix)) return prefix;
     }
 
     return null;
+  }
+
+  getCategories() {
+    const grouped = new Map();
+
+    for (const [name, command] of this.commands) {
+      if (!grouped.has(command.category)) {
+        grouped.set(command.category, []);
+      }
+
+      const commands = grouped.get(command.category);
+      const duplicate = commands.some((existingName) => {
+        const existing = this.commands.get(existingName);
+        return (
+          existing.module === command.module &&
+          existing.handler.name === command.handler.name
+        );
+      });
+
+      if (!duplicate) commands.push(name);
+    }
+
+    return [...grouped.entries()].sort(([left], [right]) => {
+      const leftIndex = CATEGORY_ORDER.indexOf(left);
+      const rightIndex = CATEGORY_ORDER.indexOf(right);
+      return leftIndex - rightIndex;
+    });
   }
 
   async handle(msg) {
@@ -69,48 +109,47 @@ export default class CommandHandler {
     const trimmed = body.slice(prefix.length).trim();
     if (!trimmed) return;
 
-    const parts = trimmed.split(/\s+/);
-    const cmdName = parts[0].toLowerCase();
-    const args = parts.slice(1);
-    const text = args.join(" ");
-
-    const command = this.commands.get(cmdName);
+    const [commandName, ...args] = trimmed.split(/\s+/);
+    const command = this.commands.get(commandName.toLowerCase());
     if (!command) return;
 
     Logger.cmd({
-      command: cmdName,
+      command: commandName,
       pushname: msg.pushName,
       isGroup: msg.isGroup,
     });
 
     try {
-      await command.handler(msg, { args, text, prefix, command: cmdName });
-    } catch (err) {
-      const errMsg =
-        typeof err === "string" ? err : err?.message || "Unknown error";
-      await msg.reply(errMsg);
+      await command.handler(msg, {
+        args,
+        text: args.join(" "),
+        prefix,
+        command: commandName,
+      });
+    } catch (error) {
+      const message =
+        typeof error === "string"
+          ? error
+          : error?.message || "Unknown error";
+      await msg.reply(message);
     }
   }
 
   async #handleEval(msg, body) {
     if (!body.startsWith(">")) return;
-
-    const botNumber = this.bot.decodeJid(this.bot.sock.user.id);
-    const isCreator = [botNumber, ...this.bot.config.bot.ownerJid]
-      .map((v) => v.replace(/[^0-9]/g, "") + "@s.whatsapp.net")
-      .includes(msg.sender);
-
-    if (!isCreator) return;
+    if (msg.isGroup) return;
+    if (!msg.isOwner()) return;
 
     try {
-      let evaled = await eval(body.slice(2));
-      if (typeof evaled !== "string") {
-        const util = await import("node:util");
-        evaled = util.default.inspect(evaled);
-      }
-      await msg.reply(String(evaled));
-    } catch (err) {
-      await msg.reply(String(err));
+      const expression = body.slice(1).trim();
+      if (!expression) return;
+
+      const result = await eval(expression);
+      await msg.reply(
+        typeof result === "string" ? result : util.inspect(result),
+      );
+    } catch (error) {
+      await msg.reply(String(error));
     }
   }
 }

@@ -1,6 +1,8 @@
-import { makeKeyvAuthState } from "@rodrigogs/baileys-store";
+import { BufferJSON, initAuthCreds, proto } from "@whiskeysockets/baileys";
 import fs from "node:fs";
 import initSqlJs from "sql.js";
+
+const SESSION_KEY = "bagah-bot";
 
 class SqlJsStorageAdapter {
   #db;
@@ -16,8 +18,7 @@ class SqlJsStorageAdapter {
     const SQL = await initSqlJs();
 
     if (fs.existsSync(this.#path)) {
-      const buffer = fs.readFileSync(this.#path);
-      this.#db = new SQL.Database(buffer);
+      this.#db = new SQL.Database(fs.readFileSync(this.#path));
     } else {
       this.#db = new SQL.Database();
     }
@@ -36,36 +37,52 @@ class SqlJsStorageAdapter {
   }
 
   #saveToDisk() {
-    const data = this.#db.export();
-    fs.writeFileSync(this.#path, Buffer.from(data));
+    fs.writeFileSync(this.#path, Buffer.from(this.#db.export()), {
+      mode: 0o600,
+    });
+    try {
+      fs.chmodSync(this.#path, 0o600);
+    } catch {}
   }
 
   async get(key) {
     await this.#ready;
-    const stmt = this.#db.prepare("SELECT value FROM kv WHERE key = ?");
-    stmt.bind([key]);
+
+    const statement = this.#db.prepare("SELECT value FROM kv WHERE key = ?");
+    statement.bind([key]);
+
     let result;
-    if (stmt.step()) {
-      result = stmt.getAsObject().value;
+    if (statement.step()) {
+      result = statement.getAsObject().value;
     }
-    stmt.free();
+    statement.free();
+
     return result ?? undefined;
   }
 
-  async set(key, value, _ttl) {
+  async setMany(entries) {
     await this.#ready;
-    this.#db.run("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
-      key,
-      value,
-    ]);
-    this.#saveToDisk();
-  }
+    if (!entries.length) return;
 
-  async delete(key) {
-    await this.#ready;
-    this.#db.run("DELETE FROM kv WHERE key = ?", [key]);
+    this.#db.run("BEGIN");
+    try {
+      for (const { key, value } of entries) {
+        if (value === null) {
+          this.#db.run("DELETE FROM kv WHERE key = ?", [key]);
+        } else {
+          this.#db.run("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
+            key,
+            value,
+          ]);
+        }
+      }
+      this.#db.run("COMMIT");
+    } catch (error) {
+      this.#db.run("ROLLBACK");
+      throw error;
+    }
+
     this.#saveToDisk();
-    return true;
   }
 
   async clear() {
@@ -75,8 +92,89 @@ class SqlJsStorageAdapter {
   }
 }
 
-export async function useSQLiteAuthState(sessionPath = "session.db") {
-  const adapter = new SqlJsStorageAdapter(sessionPath);
-  await adapter.ready();
-  return makeKeyvAuthState(adapter, "bagah-bot");
+export default class SQLiteAuthState {
+  #storage;
+  #creds;
+  state;
+
+  constructor(storage) {
+    this.#storage = storage;
+  }
+
+  static async create(sessionPath = "session.db") {
+    const storage = new SqlJsStorageAdapter(sessionPath);
+    await storage.ready();
+
+    const authState = new SQLiteAuthState(storage);
+    await authState.#init();
+    return authState;
+  }
+
+  #storageKey(key) {
+    return `${SESSION_KEY}:${key}`;
+  }
+
+  async #readData(key) {
+    try {
+      const data = await this.#storage.get(this.#storageKey(key));
+      return data ? JSON.parse(data, BufferJSON.reviver) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #serialize(data) {
+    return JSON.stringify(data, BufferJSON.replacer);
+  }
+
+  async #init() {
+    this.#creds = (await this.#readData("creds")) || initAuthCreds();
+
+    this.state = {
+      creds: this.#creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(
+            ids.map(async (id) => {
+              let value = await this.#readData(`${type}-${id}`);
+              if (type === "app-state-sync-key" && value) {
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+              }
+              data[id] = value;
+            }),
+          );
+          return data;
+        },
+        set: async (data) => {
+          const entries = [];
+
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              entries.push({
+                key: this.#storageKey(`${category}-${id}`),
+                value: value ? this.#serialize(value) : null,
+              });
+            }
+          }
+
+          await this.#storage.setMany(entries);
+        },
+      },
+    };
+  }
+
+  saveCreds() {
+    return this.#storage.setMany([
+      {
+        key: this.#storageKey("creds"),
+        value: this.#serialize(this.#creds),
+      },
+    ]);
+  }
+
+  clearState() {
+    return this.#storage.clear();
+  }
 }

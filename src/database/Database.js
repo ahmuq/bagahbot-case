@@ -1,29 +1,31 @@
 import fs from "node:fs";
 import initSqlJs from "sql.js";
 
+const USER_FIELDS = ["name", "premium", "banned", "saldo"];
+const GROUP_FIELDS = ["name", "antilink", "welcome"];
+
 export default class Database {
   constructor(dbPath = "database.db") {
     this.dbPath = dbPath;
     this.db = null;
-    this._ready = this.#init();
+    this.readyPromise = this.#init();
   }
 
   async #init() {
     const SQL = await initSqlJs();
 
     if (fs.existsSync(this.dbPath)) {
-      const buffer = fs.readFileSync(this.dbPath);
-      this.db = new SQL.Database(buffer);
+      this.db = new SQL.Database(fs.readFileSync(this.dbPath));
     } else {
       this.db = new SQL.Database();
     }
 
     this.#initTables();
-    this.save();
+    this.#save();
   }
 
   async ready() {
-    await this._ready;
+    await this.readyPromise;
   }
 
   #initTables() {
@@ -46,41 +48,77 @@ export default class Database {
         created_at TEXT DEFAULT (datetime('now'))
       )
     `);
-    this.db.run(`CREATE TABLE IF NOT EXISTS owners ( jid TEXT PRIMARY KEY )`);
-    this.db.run(
-      `CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT )`,
-    );
-    this.db.run(
-      `CREATE TABLE IF NOT EXISTS kv_store ( key TEXT PRIMARY KEY, value TEXT )`,
-    );
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS owners (
+        jid TEXT PRIMARY KEY
+      )
+    `);
   }
 
-  save() {
-    const data = this.db.export();
-    fs.writeFileSync(this.dbPath, Buffer.from(data));
+  #save() {
+    fs.writeFileSync(this.dbPath, Buffer.from(this.db.export()), {
+      mode: 0o600,
+    });
+    try {
+      fs.chmodSync(this.dbPath, 0o600);
+    } catch {}
   }
 
   #getOne(sql, params = []) {
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
+    const statement = this.db.prepare(sql);
+    statement.bind(params);
+
     let result = null;
-    if (stmt.step()) result = stmt.getAsObject();
-    stmt.free();
+    if (statement.step()) result = statement.getAsObject();
+
+    statement.free();
     return result;
   }
 
   #getAll(sql, params = []) {
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
+    const statement = this.db.prepare(sql);
+    statement.bind(params);
+
     const results = [];
-    while (stmt.step()) results.push(stmt.getAsObject());
-    stmt.free();
+    while (statement.step()) results.push(statement.getAsObject());
+
+    statement.free();
     return results;
   }
 
   #run(sql, params = []) {
     this.db.run(sql, params);
-    this.save();
+    this.#save();
+  }
+
+  #pickFields(data, allowedFields) {
+    return Object.entries(data).filter(([key]) => allowedFields.includes(key));
+  }
+
+  #upsert(table, jid, data, allowedFields, defaults) {
+    const fields = this.#pickFields(data, allowedFields);
+    const existing = this.#getOne(`SELECT 1 FROM ${table} WHERE jid = ?`, [jid]);
+
+    if (existing) {
+      if (!fields.length) return;
+
+      const assignments = fields.map(([key]) => `${key} = ?`).join(", ");
+      const values = fields.map(([, value]) => value);
+      this.#run(`UPDATE ${table} SET ${assignments} WHERE jid = ?`, [
+        ...values,
+        jid,
+      ]);
+      return;
+    }
+
+    const merged = { ...defaults, ...Object.fromEntries(fields) };
+    const columns = Object.keys(merged);
+    const placeholders = columns.map(() => "?").join(", ");
+
+    this.#run(
+      `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`,
+      columns.map((column) => merged[column]),
+    );
   }
 
   getUser(jid) {
@@ -88,32 +126,13 @@ export default class Database {
   }
 
   upsertUser(jid, data = {}) {
-    const existing = this.getUser(jid);
-    if (existing) {
-      const fields = Object.keys(data);
-      if (!fields.length) return;
-      const sets = fields.map((k) => `${k} = ?`).join(", ");
-      const vals = fields.map((k) => data[k]);
-      this.#run(`UPDATE users SET ${sets} WHERE jid = ?`, [...vals, jid]);
-    } else {
-      const merged = {
-        jid,
-        name: null,
-        premium: 0,
-        banned: 0,
-        saldo: 0,
-        ...data,
-      };
-      this.#run(
-        "INSERT INTO users (jid, name, premium, banned, saldo) VALUES (?, ?, ?, ?, ?)",
-        [merged.jid, merged.name, merged.premium, merged.banned, merged.saldo],
-      );
-    }
-  }
-
-  isPremium(jid) {
-    const row = this.getUser(jid);
-    return row?.premium === 1;
+    this.#upsert(
+      "users",
+      jid,
+      data,
+      USER_FIELDS,
+      { jid, name: null, premium: 0, banned: 0, saldo: 0 },
+    );
   }
 
   setPremium(jid, status = true) {
@@ -129,29 +148,17 @@ export default class Database {
   }
 
   upsertGroup(jid, data = {}) {
-    const existing = this.getGroup(jid);
-    if (existing) {
-      const fields = Object.keys(data);
-      if (!fields.length) return;
-      const sets = fields.map((k) => `${k} = ?`).join(", ");
-      const vals = fields.map((k) => data[k]);
-      this.#run(`UPDATE groups SET ${sets} WHERE jid = ?`, [...vals, jid]);
-    } else {
-      const merged = { jid, name: null, antilink: 0, welcome: 1, ...data };
-      this.#run(
-        "INSERT INTO groups (jid, name, antilink, welcome) VALUES (?, ?, ?, ?)",
-        [merged.jid, merged.name, merged.antilink, merged.welcome],
-      );
-    }
+    this.#upsert(
+      "groups",
+      jid,
+      data,
+      GROUP_FIELDS,
+      { jid, name: null, antilink: 0, welcome: 1 },
+    );
   }
 
   isAntilink(jid) {
-    const row = this.getGroup(jid);
-    return row?.antilink === 1;
-  }
-
-  getOwners() {
-    return this.#getAll("SELECT jid FROM owners").map((r) => r.jid);
+    return this.getGroup(jid)?.antilink === 1;
   }
 
   addOwner(jid) {
@@ -160,42 +167,5 @@ export default class Database {
 
   removeOwner(jid) {
     this.#run("DELETE FROM owners WHERE jid = ?", [jid]);
-  }
-
-  isOwner(jid) {
-    return !!this.#getOne("SELECT 1 FROM owners WHERE jid = ?", [jid]);
-  }
-
-  getSetting(key) {
-    const row = this.#getOne("SELECT value FROM settings WHERE key = ?", [key]);
-    return row ? JSON.parse(row.value) : null;
-  }
-
-  setSetting(key, value) {
-    this.#run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [
-      key,
-      JSON.stringify(value),
-    ]);
-  }
-
-  getKV(key) {
-    const row = this.#getOne("SELECT value FROM kv_store WHERE key = ?", [key]);
-    return row ? JSON.parse(row.value) : null;
-  }
-
-  setKV(key, value) {
-    this.#run("INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)", [
-      key,
-      JSON.stringify(value),
-    ]);
-  }
-
-  deleteKV(key) {
-    this.#run("DELETE FROM kv_store WHERE key = ?", [key]);
-  }
-
-  close() {
-    this.save();
-    this.db.close();
   }
 }

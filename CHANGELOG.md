@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+- Upgrade `@whiskeysockets/baileys` to `7.0.0-rc14`
+- Require Node.js 22+
+- Replace `@rodrigogs/baileys-store` with a native SQLite auth state and local contact cache
+- Remove unused `settings`/`kv_store` database tables and helper methods
+
+### Bug Fixes
+
+- Fix LID phone lookup for `getPNForLID` (now async in Baileys v7)
+- Fix quoted media download using the quoted message type instead of the outer type
+- Fix view-once message parsing for `viewOnceMessageV2`
+- Only handle `notify` message upserts so history sync cannot trigger commands
+- Make the antilink feature usable with `!antilink on|off`
+- Replace hardcoded +212 blocking with configurable `BOT_BLOCKED_PREFIXES`
+- Prevent duplicate `creds.update` saves and reconnects
+- Render QR in terminal when pairing is disabled
+- Clean up temporary sticker/upload files and avoid shell interpolation in ffmpeg calls
+- Whitelist database columns during upserts
+- Restrict owner eval to private chats
+- Write `session.db` and `database.db` with mode `0600`
+
+### Refactor
+
+- Group utility functions into classes (`Helpers`, `Env`, `Uploader`, `SQLiteAuthState`)
+- Generate menus from the command registry instead of hardcoded lists
+- Centralize owner checks, group metadata caching, and error handling
+- Remove unused helpers, serializer methods, API fields, and dead code
+- Replace deprecated `fluent-ffmpeg` with a small `FFmpeg` wrapper
+- Commit `package-lock.json` and use `npm ci` for reproducible installs
+
+### Security
+
+- `npm audit`: 0 vulnerabilities
+- Remove duplicate Baileys v6 instance pulled in by `@rodrigogs/baileys-store`
+- Override transitive `zod` to `^4.6.7` for the jimp advisory GHSA-mrhx-c7xc-m3w5
+
+### Tests
+
+- Add 49 unit tests with the built-in `node:test` runner
+
 ## [1.2.1](https://github.com/ahmuq/abot-case/compare/v1.2.0...v1.2.1) (2026-03-02)
 
 

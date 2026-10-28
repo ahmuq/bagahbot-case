@@ -1,5 +1,6 @@
 import { areJidsSameUser, jidNormalizedUser } from "@whiskeysockets/baileys";
-import { jsonformat } from "../utils/helpers.js";
+
+import Helpers from "../utils/helpers.js";
 
 export default class GroupCommand {
   constructor(bot) {
@@ -23,157 +24,195 @@ export default class GroupCommand {
       ["linkgroup", { handler: this.linkGroup.bind(this), category: "group" }],
       ["linkgc", { handler: this.linkGroup.bind(this), category: "group" }],
       ["lgc", { handler: this.linkGroup.bind(this), category: "group" }],
+      ["antilink", { handler: this.antilink.bind(this), category: "group" }],
     ]);
   }
 
   async #getGroupContext(msg) {
     if (!msg.isGroup) throw this.bot.config.messages.group;
 
-    const botNumber = this.bot.decodeJid(this.bot.sock.user.id);
-    const metadata = await this.bot.sock.groupMetadata(msg.chat);
-    const participants = metadata.participants;
-    const admins = participants
-      .filter((v) => v.admin !== null)
-      .map((v) => v.id);
-    const isBotAdmin = admins.some((a) => areJidsSameUser(a, botNumber));
-    const isAdmin = admins.some((a) => areJidsSameUser(a, msg.sender));
+    const metadata = await this.bot.getGroupMetadata(msg.chat);
+    const admins = metadata.participants
+      .filter((participant) => Boolean(participant.admin))
+      .map((participant) => participant.id);
+    const botJid = this.bot.decodeJid(this.bot.sock.user.id);
+    const isBotAdmin = admins.some((admin) =>
+      areJidsSameUser(admin, botJid),
+    );
+    const isAdmin =
+      msg.senderJids.some((sender) =>
+        admins.some((admin) => areJidsSameUser(admin, sender)),
+      ) || msg.isOwner();
 
-    return { metadata, participants, admins, isBotAdmin, isAdmin, botNumber };
+    return { metadata, isBotAdmin, isAdmin };
   }
 
-  #getTargetUsers(msg, { text }) {
-    return msg.mentionedJid?.[0]
-      ? msg.mentionedJid
-      : msg.quoted
-        ? [msg.quoted.sender]
-        : text
-          ? [jidNormalizedUser(text.replace(/[^0-9]/g, "") + "@s.whatsapp.net")]
-          : [];
+  #getTargetUsers(msg, text) {
+    if (msg.mentionedJid?.length) return msg.mentionedJid;
+    if (msg.quoted?.sender) return [msg.quoted.sender];
+
+    const number = text?.replace(/[^0-9]/g, "");
+    if (!number || number.length < 8) return [];
+    return [jidNormalizedUser(`${number}@s.whatsapp.net`)];
   }
 
-  async promote(msg, opts) {
-    const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isBotAdmin) throw this.bot.config.messages.botAdmin;
+  #requireAdmin(ctx) {
     if (!ctx.isAdmin) throw this.bot.config.messages.admin;
+  }
 
-    const users = this.#getTargetUsers(msg, opts);
+  #requireBotAdmin(ctx) {
+    if (!ctx.isBotAdmin) throw this.bot.config.messages.botAdmin;
+  }
+
+  async promote(msg, { text }) {
+    const ctx = await this.#getGroupContext(msg);
+    this.#requireAdmin(ctx);
+    this.#requireBotAdmin(ctx);
+
+    const users = this.#getTargetUsers(msg, text);
     if (!users.length) throw "Tag atau reply user yang ingin di-promote";
 
-    const res = await this.bot.sock.groupParticipantsUpdate(
+    const result = await this.bot.sock.groupParticipantsUpdate(
       msg.chat,
       users,
       "promote",
     );
-    await msg.reply(jsonformat(res));
+    await msg.reply(Helpers.jsonformat(result));
   }
 
-  async demote(msg, opts) {
+  async demote(msg, { text }) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isBotAdmin) throw this.bot.config.messages.botAdmin;
-    if (!ctx.isAdmin) throw this.bot.config.messages.admin;
+    this.#requireAdmin(ctx);
+    this.#requireBotAdmin(ctx);
 
-    const users = this.#getTargetUsers(msg, opts);
+    const users = this.#getTargetUsers(msg, text);
     if (!users.length) throw "Tag atau reply user yang ingin di-demote";
 
-    const res = await this.bot.sock.groupParticipantsUpdate(
+    const result = await this.bot.sock.groupParticipantsUpdate(
       msg.chat,
       users,
       "demote",
     );
-    await msg.reply(jsonformat(res));
+    await msg.reply(Helpers.jsonformat(result));
   }
 
   async leave(msg) {
-    if (!this.bot.isCreator(msg.sender)) throw this.bot.config.messages.owner;
-    const res = await this.bot.sock.groupLeave(msg.chat);
-    await msg.reply(jsonformat(res));
+    if (!msg.isOwner()) {
+      throw this.bot.config.messages.owner;
+    }
+
+    await this.bot.sock.groupLeave(msg.chat);
+    await msg.reply("Sukses keluar dari group");
   }
 
-  async kick(msg, opts) {
+  async kick(msg, { text }) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isAdmin) throw "Perintah ini hanya bisa digunakan oleh Admin Grup";
+    this.#requireAdmin(ctx);
+    this.#requireBotAdmin(ctx);
 
-    const users = this.#getTargetUsers(msg, opts);
+    const users = this.#getTargetUsers(msg, text);
     if (!users.length) throw "Tag atau reply user yang ingin di-kick";
 
     await msg.reply("Otw kick...");
-    const res = await this.bot.sock.groupParticipantsUpdate(
+    const result = await this.bot.sock.groupParticipantsUpdate(
       msg.chat,
       users,
       "remove",
     );
-    await msg.reply(jsonformat(res));
+    await msg.reply(Helpers.jsonformat(result));
   }
 
   async hidetag(msg, { text }) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isAdmin && !this.bot.isCreator(msg.sender)) {
-      throw "Perintah ini hanya bisa digunakan oleh Admin Grup";
-    }
+    this.#requireAdmin(ctx);
 
     await this.bot.sock.sendMessage(msg.chat, {
       text: text || "",
-      mentions: ctx.participants.map((p) => p.id),
+      mentions: ctx.metadata.participants.map((participant) => participant.id),
     });
   }
 
   async tagAll(msg, { text }) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isAdmin && !this.bot.isCreator(msg.sender)) {
-      throw this.bot.config.messages.admin;
-    }
+    this.#requireAdmin(ctx);
     if (!text) throw "Teks?";
 
-    let teksTall = `══✪〘 *😎 Tag All* 〙✪══\n\n${text}\n\n`;
-    for (const mem of ctx.participants) {
-      teksTall += `⚘ @${mem.id.split("@")[0]}\n`;
-    }
+    const mentions = ctx.metadata.participants.map(
+      (participant) => participant.id,
+    );
+    const lines = mentions.map(
+      (jid) => `⚘ @${jid.split("@")[0]}`,
+    );
+    const message = [
+      "══✪〘 *😎 Tag All* 〙✪══",
+      "",
+      text,
+      "",
+      ...lines,
+    ].join("\n");
 
     await this.bot.sock.sendMessage(msg.chat, {
-      text: teksTall,
-      mentions: ctx.participants.map((p) => p.id),
+      text: message,
+      mentions,
     });
+  }
+
+  async groupSetting(msg, { args }) {
+    const ctx = await this.#getGroupContext(msg);
+    this.#requireAdmin(ctx);
+    this.#requireBotAdmin(ctx);
+
+    const mode = args[0];
+    if (mode !== "c" && mode !== "o") {
+      throw "Kirim perintah !gc o/c\nContoh : !gc c (close) atau !gc o (open)";
+    }
+
+    const announcement = mode === "c";
+    await this.bot.sock.groupSettingUpdate(
+      msg.chat,
+      announcement ? "announcement" : "not_announcement",
+    );
+    await msg.reply(
+      announcement
+        ? "Sukses mengizinkan hanya admin yang dapat mengirim pesan"
+        : "Sukses mengizinkan semua peserta dapat mengirim pesan",
+    );
   }
 
   async closeGroup(msg) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isAdmin) throw "Perintah ini hanya bisa digunakan oleh Admin Grup";
+    this.#requireAdmin(ctx);
+    this.#requireBotAdmin(ctx);
 
     await this.bot.sock.groupSettingUpdate(msg.chat, "announcement");
     await msg.reply("Sukses menutup grup");
   }
 
-  async groupSetting(msg, { args }) {
-    const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isAdmin) throw "Perintah ini hanya bisa digunakan oleh Admin Grup";
-
-    if (!args[0])
-      throw "Kirim perintah !gc o/c\nContoh : !gc c (close) atau !gc o (open)";
-
-    if (args[0] === "c") {
-      await this.bot.sock.groupSettingUpdate(msg.chat, "announcement");
-      await msg.reply(
-        "Sukses mengizinkan hanya admin yang dapat mengirim pesan",
-      );
-    } else if (args[0] === "o") {
-      await this.bot.sock.groupSettingUpdate(msg.chat, "not_announcement");
-      await msg.reply("Sukses mengizinkan semua peserta dapat mengirim pesan");
-    } else {
-      throw "Kirim perintah !gc o/c\nContoh : !gc c (close) atau !gc o (open)";
-    }
-  }
-
   async linkGroup(msg) {
     const ctx = await this.#getGroupContext(msg);
-    if (!ctx.isBotAdmin) throw this.bot.config.messages.botAdmin;
+    this.#requireBotAdmin(ctx);
 
     const code = await this.bot.sock.groupInviteCode(msg.chat);
-    await this.bot.sock.sendMessage(
-      msg.chat,
-      {
-        text: `https://chat.whatsapp.com/${code}\n\nLink Group : ${ctx.metadata.subject}`,
-      },
-      { quoted: msg.raw },
+    await msg.reply(
+      `https://chat.whatsapp.com/${code}\n\nLink Group : ${ctx.metadata.subject}`,
     );
+  }
+
+  async antilink(msg, { args }) {
+    const ctx = await this.#getGroupContext(msg);
+    this.#requireAdmin(ctx);
+
+    const mode = args[0]?.toLowerCase();
+    if (mode !== "on" && mode !== "off") {
+      throw "Contoh penggunaan: !antilink on / !antilink off";
+    }
+
+    const enabled = mode === "on" ? 1 : 0;
+    this.bot.db.upsertGroup(msg.chat, {
+      name: ctx.metadata.subject,
+      antilink: enabled,
+    });
+
+    await msg.reply(`Antilink ${enabled ? "diaktifkan" : "dimatikan"}`);
   }
 }

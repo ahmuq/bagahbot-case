@@ -1,11 +1,11 @@
-﻿<div align="center">
+<div align="center">
 
 # Bagah Bot
 
-WhatsApp Bot — ESM · OOP · Baileys v7 · SQLite
+WhatsApp Bot — ESM · OOP · Baileys rc14 · SQLite
 
-[![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
-[![Baileys](https://img.shields.io/badge/Baileys-v7%20RC-25D366?style=flat-square&logo=whatsapp&logoColor=white)](https://github.com/WhiskeySockets/Baileys)
+[![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![Baileys](https://img.shields.io/badge/Baileys-7.0.0--rc14-25D366?style=flat-square&logo=whatsapp&logoColor=white)](https://github.com/WhiskeySockets/Baileys)
 [![License](https://img.shields.io/badge/License-ISC-blue?style=flat-square)](LICENSE)
 
 </div>
@@ -14,17 +14,17 @@ WhatsApp Bot — ESM · OOP · Baileys v7 · SQLite
 
 ## Tentang
 
-Bagah Bot adalah WhatsApp bot yang ditulis dengan arsitektur **ESM + OOP** menggunakan **Baileys v7** (dengan LID support) dan **SQLite** (via sql.js) untuk session & database. Semua config di-load dari `.env` sehingga aman `git pull` tanpa conflict.
+Bagah Bot adalah WhatsApp bot yang ditulis dengan arsitektur **ESM + OOP** menggunakan **Baileys 7.0.0-rc14** (dengan LID support) dan **SQLite** (via sql.js) untuk session & database. Semua config di-load dari `.env` sehingga aman `git pull` tanpa conflict.
 
 ## Fitur
 
-- **Baileys v7 RC** — LID support, native ESM, pairing code (custom 8-digit)
-- **SQLite session** — `session.db` via sql.js (pure JS, tanpa C++ build tools)
+- **Baileys 7.0.0-rc14** — LID support, native ESM, pairing code (custom 8-digit), QR terminal fallback
+- **SQLite session** — `session.db` via sql.js dengan auth state native Baileys (tanpa C++ build tools)
 - **SQLite database** — `database.db` menggantikan banyak file `.json`
-- **@rodrigogs/baileys-store v2** — in-memory store + Keyv auth state
 - **Modular commands** — setiap kategori command 1 file class terpisah
 - **Config via `.env`** — tidak ada value sensitif di source code
 - AI, downloader, search, sticker, group management, owner tools
+- **Unit test** — `node:test` bawaan Node.js, tanpa framework tambahan
 - **BagahProject API** — semua fitur downloader pakai API dari [bagahproject.com](https://bagahproject.com)
 
 ## Struktur Project
@@ -39,29 +39,43 @@ bagah-bot/
 └── src/
     ├── BagahBot.js            # Kelas utama (koneksi, events, send)
     ├── config/
-    │   └── index.js           # Baca .env → config object
+    │   ├── index.js           # Config object dari .env
+    │   └── env.js             # Parser .env yang bisa dites
     ├── database/
-    │   ├── Database.js        # SQLite wrapper (users, groups, settings)
-    │   └── AuthState.js       # Session SQLite adapter untuk baileys
+    │   ├── Database.js        # SQLite wrapper (users, groups, owners)
+    │   └── AuthState.js       # Auth state SQLite native Baileys
     ├── handlers/
     │   ├── CommandHandler.js   # Register & route semua command
     │   └── GroupHandler.js     # Handle join/leave group
     ├── commands/               # ← TAMBAH COMMAND DI SINI
     │   ├── GeneralCommand.js   # menu, runtime
     │   ├── MakerCommand.js     # sticker, toimg, tts
-    │   ├── GroupCommand.js     # promote, demote, kick, hidetag, tagall
-    │   ├── OwnerCommand.js     # setppbot, addpremium, broadcast
+    │   ├── GroupCommand.js     # promote, demote, kick, hidetag, tagall, antilink
+    │   ├── OwnerCommand.js     # setppbot, addprem, delprem, listprem
     │   ├── DownloaderCommand.js# tiktok, fb, ig, igstory
     │   ├── SearchCommand.js    # tiktokstalk
     │   └── AiCommand.js        # ai
     ├── lib/
     │   ├── BagahAPI.js        # Client API bagahproject.com
     │   ├── Exif.js            # WebP sticker + EXIF metadata
+    │   ├── FFmpeg.js          # Wrapper execFile ffmpeg
     │   └── uploader.js        # File upload (telegraph, etc)
     └── utils/
-        ├── helpers.js         # Utility functions
+        ├── helpers.js         # Helpers class (HTTP, waktu, random, JSON)
         ├── logger.js          # Console logging dengan chalk
         └── serializer.js      # Message class (wrap raw baileys msg)
+
+test/                          # Unit test (node:test)
+├── authState.test.js
+├── bagahbot.test.js
+├── commandHandler.test.js
+├── database.test.js
+├── downloader.test.js
+├── env.test.js
+├── exif.test.js
+├── groupCommand.test.js
+├── helpers.test.js
+└── serializer.test.js
 ```
 
 ## Instalasi
@@ -71,7 +85,7 @@ bagah-bot/
 ```bash
 git clone https://github.com/ahmuq/abot-case.git bagah-bot
 cd bagah-bot
-npm install
+npm ci
 ```
 
 ### 2. Setup config
@@ -89,6 +103,8 @@ PAIRING_ENABLED=true
 PAIRING_NUMBER=628xxxxxxxxxx
 PAIRING_CUSTOM_CODE=BAGAHBOT
 API_KEY=your_api_key_here
+# Opsional: blokir nomor dengan awalan tertentu, contoh 212,234
+BOT_BLOCKED_PREFIXES=
 ```
 
 ### 3. Dapatkan API Key
@@ -106,13 +122,26 @@ npm start
 
 Scan pairing code yang muncul di terminal, lalu tunggu sampai `Bot siap menerima pesan!`.
 
-### Update tanpa conflict
+Kalau pairing dimatikan, bot akan menampilkan QR di terminal untuk di-scan.
+
+### 5. Update tanpa conflict
 
 ```bash
 git pull origin master
-npm install
+npm ci
 # .env kamu tetap aman, tidak ke-overwrite
 ```
+
+`package-lock.json` di-commit supaya versi dependency selalu konsisten. Pakai `npm ci` (bukan `npm install`) saat deploy.
+
+## Testing
+
+```bash
+npm test              # jalankan semua unit test
+npm run test:coverage # test + coverage report
+```
+
+Test memakai `node:test` bawaan Node.js, jadi tidak ada dependency framework tambahan.
 
 ---
 
@@ -148,7 +177,8 @@ async ping(msg) {
 }
 ```
 
-Selesai. Bot langsung mengenali `!ping`.
+Selesai. Bot langsung mengenali `!ping`. Menu otomatis ikut ter-update karena
+daftar command diambil dari registry berdasarkan `category`.
 
 ### Cara 2 — Buat module command baru
 
@@ -199,7 +229,7 @@ const modules = [
 ];
 ```
 
-Selesai. Semua command dari `FunCommand` langsung aktif.
+Selesai. Semua command dari `FunCommand` langsung aktif dan otomatis muncul di menu.
 
 ### Pola handler
 
@@ -243,16 +273,26 @@ async namaCommand(msg, { args, text, command }) {
 
 | Komponen | Library                                 |
 | -------- | --------------------------------------- |
-| WhatsApp | `@whiskeysockets/baileys` v7 RC         |
-| Store    | `@rodrigogs/baileys-store` v2           |
+| WhatsApp | `@whiskeysockets/baileys` 7.0.0-rc14     |
 | Database | `sql.js` (pure JS SQLite)               |
-| Sticker  | `jimp`, `node-webpmux`, `fluent-ffmpeg` |
+| Sticker  | `jimp`, `node-webpmux`, FFmpeg (system)     |
 | HTTP     | `axios`                                 |
 
 ## Requirements
 
-- Node.js 20+
-- FFmpeg (untuk sticker video)
+- Node.js 22+
+- FFmpeg dengan encoder `libwebp` (untuk sticker gambar/video)
+  - Cek dengan `ffmpeg -encoders | grep libwebp`
+  - Build Homebrew tertentu belum menyertakan libwebp; gunakan build FFmpeg yang mendukungnya
+
+## Keamanan & Perawatan
+
+- Jalankan `npm audit` secara berkala. Saat upgrade ini hasilnya `0 vulnerabilities`.
+- `package-lock.json` disimpan di repo, jadi deploy memakai `npm ci` agar reproducible.
+- Override `zod` ke `^4.6.7` diperlukan karena `jimp@1.6.1` masih memakai `zod@3`
+  yang terkena advisory GHSA-mrhx-c7xc-m3w5. Override bisa dihapus setelah Jimp
+  merilis versi yang memakai `zod@4`.
+- Jangan commit `.env`, `session.db`, atau `database.db`.
 
 ## License
 
