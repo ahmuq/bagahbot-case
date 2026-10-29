@@ -35,6 +35,9 @@ bagah-bot/
 ├── .env                       # Config deployment (gitignored)
 ├── .env.example               # Template config (di-commit)
 ├── package.json
+├── .github/workflows/
+│   ├── ci.yml                 # Test + audit otomatis
+│   └── release.yml            # Release manual (bump version + tag)
 │
 └── src/
     ├── BagahBot.js            # Kelas utama (koneksi, events, send)
@@ -83,7 +86,7 @@ test/                          # Unit test (node:test)
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/ahmuq/abot-case.git bagah-bot
+git clone https://github.com/ahmuq/bagahbot-case.git bagah-bot
 cd bagah-bot
 npm ci
 ```
@@ -142,6 +145,43 @@ npm run test:coverage # test + coverage report
 ```
 
 Test memakai `node:test` bawaan Node.js, jadi tidak ada dependency framework tambahan.
+
+## CI/CD
+
+### CI
+
+`.github/workflows/ci.yml` berjalan otomatis saat push ke branch mana pun,
+pull request, atau manual dari tab Actions:
+
+- `npm ci`
+- `npm test` di Node.js 22 dan 24
+- `npm audit --audit-level=high`
+
+### Release
+
+Release dijalankan manual dari **Actions → Release → Run workflow**.
+
+Input yang tersedia:
+
+| Input | Keterangan |
+| --- | --- |
+| `bump` | `patch`, `minor`, `major`, atau `prerelease` |
+| `preid` | Identifier prerelease, default `rc` (hanya untuk `prerelease`) |
+| `dry_run` | Preview perubahan tanpa commit, tag, push, atau release |
+
+Workflow hanya bisa dijalankan dari branch `main`, lalu:
+
+1. Menjalankan `npm ci`, `npm test`, dan `npm audit`.
+2. Menaikkan version di `package.json` dan `package-lock.json`.
+3. Commit `chore(release): vX.Y.Z` dan membuat tag `vX.Y.Z`.
+4. Push commit + tag.
+5. Membuat GitHub Release dengan release notes yang di-generate otomatis
+   dari commit/PR sejak tag sebelumnya.
+
+Release notes dibuat otomatis oleh GitHub dari commit/PR sejak tag sebelumnya;
+tidak ada file changelog manual yang perlu di-update. Jika branch protection
+memblokir push dari GitHub Actions, buat secret `RELEASE_TOKEN` berisi PAT
+dengan akses `contents: write`.
 
 ---
 
