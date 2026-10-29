@@ -1,5 +1,7 @@
 import axios from "axios";
 
+const REQUEST_TIMEOUT_MS = 30_000;
+
 export default class BagahAPI {
   #baseUrl;
   #apiKey;
@@ -10,9 +12,14 @@ export default class BagahAPI {
   }
 
   async #request(endpoint, params = {}) {
+    if (!this.#apiKey) {
+      throw new Error("API_KEY belum dikonfigurasi di .env");
+    }
+
     const { data } = await axios.get(`${this.#baseUrl}${endpoint}`, {
       params,
       headers: { "x-api-key": this.#apiKey },
+      timeout: REQUEST_TIMEOUT_MS,
     });
 
     if (!data.success) {
@@ -25,15 +32,13 @@ export default class BagahAPI {
   async facebookDownload(url) {
     const result = await this.#request("/api/facebook-downloader-s2", { url });
     const best =
-      result.results?.find((r) => /hd|720/i.test(r.quality)) ||
+      result.results?.find((item) => /hd|720/i.test(item.quality)) ||
       result.results?.[0];
 
     return {
-      thumbnail: result.thumbnail,
       description: result.description,
       url: best?.url,
       quality: best?.quality,
-      results: result.results,
     };
   }
 
@@ -59,12 +64,9 @@ export default class BagahAPI {
       user: {
         username: result.user?.username,
         fullName: result.user?.fullName,
-        biography: result.user?.biography,
-        profilePic: result.user?.profile_pic_url,
         followers: result.user?.followers,
         following: result.user?.following,
         posts: result.user?.posts,
-        isPrivate: result.user?.is_private,
       },
       stories: (result.url || []).map((item) => ({
         type: item.type,

@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+      preid:
+        description: Prerelease identifier (only used for prerelease)
+        required: false
+        default: rc
+        type: string
+      dry_run:
+        description: Dry run (no commit, tag, push, or release)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+    steps:
+      - name: Ensure default branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            echo "Release harus dijalankan dari branch ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Ensure clean working tree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree tidak bersih."
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          PREID: ${{ inputs.preid }}
+        run: |
+          PREID="${PREID:-rc}"
+
+          if [ "${BUMP}" = "prerelease" ]; then
+            npm version prerelease --preid "${PREID}" --no-git-tag-version
+          else
+            npm version "${BUMP}" --no-git-tag-version
+          fi
+
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Show changes
+        run: |
+          git diff --stat
+          git diff
+
+      - name: Commit, tag, and push
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${VERSION}"
+          git tag -a "${TAG}" -m "v${VERSION}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+          git push origin "${TAG}"
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          ARGS=(--title "${TAG}" --generate-notes --verify-tag)
+
+          if [ "${BUMP}" = "prerelease" ]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" "${ARGS[@]}"

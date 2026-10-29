@@ -1,7 +1,11 @@
-import { exec } from "node:child_process";
-import fs from "node:fs";
-import { telegraph } from "../lib/uploader.js";
-import { getRandom } from "../utils/helpers.js";
+import { readFile, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import FFmpeg from "../lib/FFmpeg.js";
+import Uploader from "../lib/uploader.js";
+import Helpers from "../utils/helpers.js";
+const MAX_STICKER_SECONDS = 10;
 
 export default class MakerCommand {
   constructor(bot) {
@@ -23,84 +27,96 @@ export default class MakerCommand {
   }
 
   async toImage(msg) {
-    const quoted = msg.quoted;
-    if (!quoted) throw "Reply sticker dengan caption !toimg";
-    if (!/webp/.test(msg.mime)) throw "Balas sticker dengan caption *!toimg*";
+    const quoted = this.#requireQuoted(msg, "Reply sticker dengan caption !toimg");
+    if (!/webp/.test(msg.mime)) {
+      throw "Balas sticker dengan caption *!toimg*";
+    }
 
     const media = await quoted.download();
-    const tmpIn = getRandom(".webp");
-    const tmpOut = getRandom(".png");
+    const input = this.#tmpPath(".webp");
+    const output = this.#tmpPath(".png");
 
-    fs.writeFileSync(tmpIn, media);
-
-    await new Promise((resolve, reject) => {
-      exec(`ffmpeg -i ${tmpIn} ${tmpOut}`, (err) => {
-        fs.unlinkSync(tmpIn);
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-
-    const buffer = fs.readFileSync(tmpOut);
-    await msg.sendImage(buffer);
-    fs.unlinkSync(tmpOut);
+    await writeFile(input, media);
+    try {
+      await FFmpeg.run(["-i", input, output]);
+      await msg.sendImage(await readFile(output));
+    } finally {
+      await this.#cleanup(input, output);
+    }
   }
 
   async tts(msg, { text }) {
-    if (!text) throw `Contoh:\n!tts hallo bro`;
+    if (!text) throw "Contoh:\n!tts hallo bro";
 
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=id&client=tw-ob`;
     await msg.sendAudio({ url }, true);
   }
 
   async toUrl(msg) {
-    const quoted = msg.quoted;
-    if (!quoted) throw "Kirim/Reply Image dengan caption !tourl";
-    if (!/image/.test(msg.mime))
+    const quoted = this.#requireQuoted(
+      msg,
+      "Kirim/Reply Image dengan caption !tourl",
+    );
+    if (!/image/.test(msg.mime)) {
       throw "Kirim/Reply Image dengan caption !tourl";
+    }
 
     await msg.reply(this.bot.config.messages.wait);
 
     const media = await quoted.download();
-    const tmpPath = getRandom(".jpg");
-    fs.writeFileSync(tmpPath, media);
+    const tempPath = this.#tmpPath(".jpg");
+    await writeFile(tempPath, media);
 
     try {
-      const url = await telegraph(tmpPath);
-      await this.bot.sock.sendMessage(msg.chat, {
-        text: `${url}\n\n🖨️ Nih Link Nya`,
-      });
+      const url = await Uploader.telegraph(tempPath);
+      await msg.reply(`${url}\n\n🖨️ Nih Link Nya`);
     } catch {
       await msg.reply(
         "Mohon Maaf Server Telegraph Sedang Error\nCoba Lagi Nanti",
       );
     } finally {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      await this.#cleanup(tempPath);
     }
   }
 
   async sticker(msg) {
-    const quoted = msg.quoted;
-    if (!quoted) throw "Balas Video/Image Dengan Caption !sticker";
-
+    const quoted = this.#requireQuoted(
+      msg,
+      "Balas Video/Image Dengan Caption !sticker",
+    );
     const mime = msg.mime;
     const { packname, author } = this.bot.config.sticker;
 
-    if (/image/.test(mime)) {
-      const media = await quoted.download();
-      await this.bot.sendSticker(msg.chat, media, msg.raw, {
-        packname,
-        author,
-      });
-    } else if (/video/.test(mime)) {
-      if ((quoted.msg || quoted).seconds > 11) throw "Maksimal 10 detik!";
-      const media = await quoted.download();
-      await this.bot.sendSticker(msg.chat, media, msg.raw, {
-        packname,
-        author,
-      });
-    } else {
-      throw "Kirim Gambar/Video Dengan Caption !sticker\nDurasi Video 1-9 Detik";
+    if (!/image|video/.test(mime)) {
+      throw "Kirim Gambar/Video Dengan Caption !sticker\nDurasi Video 1-10 Detik";
     }
+
+    if (/video/.test(mime)) {
+      const seconds = Number(quoted.msg?.seconds ?? quoted.seconds ?? 0);
+      if (seconds > MAX_STICKER_SECONDS) {
+        throw `Maksimal ${MAX_STICKER_SECONDS} detik!`;
+      }
+    }
+
+    const media = await quoted.download();
+    await this.bot.sendSticker(msg.chat, media, msg.raw, {
+      packname,
+      author,
+    });
+  }
+
+  #requireQuoted(msg, errorMessage) {
+    if (!msg.quoted) throw errorMessage;
+    return msg.quoted;
+  }
+
+  #tmpPath(ext) {
+    return path.join(tmpdir(), Helpers.getRandom(ext));
+  }
+
+  async #cleanup(...paths) {
+    await Promise.all(
+      paths.map((filePath) => unlink(filePath).catch(() => undefined)),
+    );
   }
 }

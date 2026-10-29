@@ -1,53 +1,61 @@
 import {
+  areJidsSameUser,
   downloadContentFromMessage,
   getContentType,
   jidNormalizedUser,
-  proto,
 } from "@whiskeysockets/baileys";
 
+const VIEW_ONCE_TYPES = new Set([
+  "viewOnceMessage",
+  "viewOnceMessageV2",
+  "viewOnceMessageV2Extension",
+]);
+
 export default class Message {
-  constructor(bot, raw, store) {
+  constructor(bot, raw) {
     this.bot = bot;
     this.raw = raw;
-    this.store = store;
     this.#parse();
   }
 
   #parse() {
-    const msg = this.raw;
+    const raw = this.raw;
 
-    this.id = msg.key.id;
-    this.chat = msg.key.remoteJid;
-    this.fromMe = msg.key.fromMe;
+    this.id = raw.key.id;
+    this.chat = raw.key.remoteJid;
+    this.fromMe = raw.key.fromMe;
     this.isGroup = this.chat?.endsWith("@g.us") || false;
-    this.isBaileys = this.id?.startsWith("BAE5") && this.id?.length === 16;
-    this.pushName = msg.pushName || "No Name";
+    this.pushName = raw.pushName || "No Name";
 
+    const participant = raw.key.participant || raw.participant;
     this.sender = this.#decodeJid(
-      (this.fromMe && this.bot.sock.user?.id) ||
-        msg.participant ||
-        msg.key.participant ||
-        this.chat ||
-        "",
+      (this.fromMe && this.bot.sock.user?.id) || participant || this.chat || "",
     );
-    if (this.isGroup) {
-      this.participant = this.#decodeJid(msg.key.participant) || "";
-    }
+    this.senderAlt = this.#decodeJid(
+      this.fromMe
+        ? this.bot.sock.user?.lid
+        : raw.key.participantAlt || raw.participantAlt,
+    );
 
-    if (!msg.message) return;
+    if (!raw.message) return;
 
     const message =
-      Object.keys(msg.message)[0] === "ephemeralMessage"
-        ? msg.message.ephemeralMessage.message
-        : msg.message;
+      Object.keys(raw.message)[0] === "ephemeralMessage"
+        ? raw.message.ephemeralMessage?.message
+        : raw.message;
+    if (!message) return;
 
-    this.mtype = getContentType(message);
-    this.msg =
-      this.mtype === "viewOnceMessage"
-        ? message[this.mtype].message[
-            getContentType(message[this.mtype].message)
-          ]
-        : message[this.mtype];
+    let mtype = getContentType(message);
+    let content = message[mtype];
+
+    if (VIEW_ONCE_TYPES.has(mtype)) {
+      const inner = content?.message;
+      mtype = getContentType(inner);
+      content = inner?.[mtype];
+    }
+
+    this.mtype = mtype;
+    this.msg = content;
 
     this.body =
       message.conversation ||
@@ -69,15 +77,10 @@ export default class Message {
 
     this.mentionedJid = this.msg?.contextInfo?.mentionedJid || [];
 
-    this.#parseQuoted(message);
-
-    if (this.msg?.url) {
-      this.download = () => this.#downloadMedia(this.msg);
-    }
+    this.#parseQuoted();
   }
 
-  #parseQuoted(message) {
-    const M = proto.WebMessageInfo;
+  #parseQuoted() {
     const contextInfo = this.msg?.contextInfo;
     if (!contextInfo?.quotedMessage) {
       this.quoted = null;
@@ -86,64 +89,49 @@ export default class Message {
 
     let quoted = contextInfo.quotedMessage;
     let type = getContentType(quoted);
-    let qMsg = quoted[type];
+    let content = quoted[type];
 
-    if (["productMessage"].includes(type)) {
-      type = getContentType(qMsg);
-      qMsg = qMsg[type];
+    while (type === "productMessage" || VIEW_ONCE_TYPES.has(type)) {
+      const next = type === "productMessage" ? content : content?.message;
+      if (!next) break;
+      type = getContentType(next);
+      content = next[type];
     }
 
-    if (typeof qMsg === "string") qMsg = { text: qMsg };
+    if (typeof content === "string") content = { text: content };
 
     this.quoted = {
-      ...qMsg,
+      ...content,
       mtype: type,
       id: contextInfo.stanzaId,
       chat: contextInfo.remoteJid || this.chat,
-      isBaileys:
-        contextInfo.stanzaId?.startsWith("BAE5") &&
-        contextInfo.stanzaId?.length === 16,
       sender: this.#decodeJid(contextInfo.participant),
-      fromMe: contextInfo.participant === this.bot.sock.user?.id,
+      fromMe: areJidsSameUser(
+        contextInfo.participant,
+        this.bot.sock.user?.id,
+      ),
       text:
-        qMsg?.text ||
-        qMsg?.caption ||
-        qMsg?.conversation ||
-        qMsg?.selectedDisplayText ||
+        content?.text ||
+        content?.caption ||
+        content?.conversation ||
+        content?.selectedDisplayText ||
         "",
-      mentionedJid: contextInfo.mentionedJid || [],
-      msg: qMsg,
-
-      delete: () => {
-        const fakeMsg = M.create({
-          key: {
-            remoteJid: this.quoted.chat,
-            fromMe: this.quoted.fromMe,
-            id: this.quoted.id,
-          },
-          message: quoted,
-          ...(this.isGroup ? { participant: this.quoted.sender } : {}),
-        });
-        return this.bot.sock.sendMessage(this.quoted.chat, {
-          delete: fakeMsg.key,
-        });
-      },
-
-      download: () => this.#downloadMedia(qMsg),
+      msg: content,
+      download: () => this.#downloadMedia(content, type),
     };
   }
 
   #decodeJid(jid) {
-    if (!jid) return jid;
-    return jidNormalizedUser(jid);
+    return jid ? jidNormalizedUser(jid) : jid;
   }
 
-  async #downloadMedia(msg) {
+  async #downloadMedia(msg, type = this.mtype) {
     const mime = (msg || this.msg)?.mimetype || "";
-    const type = this.mtype
-      ? this.mtype.replace(/Message/gi, "")
+    const mediaType = type
+      ? type.replace(/Message$/i, "")
       : mime.split("/")[0];
-    const stream = await downloadContentFromMessage(msg || this.msg, type);
+    const stream = await downloadContentFromMessage(msg || this.msg, mediaType);
+
     let buffer = Buffer.from([]);
     for await (const chunk of stream) {
       buffer = Buffer.concat([buffer, chunk]);
@@ -159,22 +147,10 @@ export default class Message {
     );
   }
 
-  async send(text) {
-    return this.bot.sock.sendMessage(this.chat, { text: String(text) });
-  }
-
   async sendImage(buffer, caption = "") {
     return this.bot.sock.sendMessage(
       this.chat,
       { image: buffer, caption },
-      { quoted: this.raw },
-    );
-  }
-
-  async sendVideo(buffer, caption = "") {
-    return this.bot.sock.sendMessage(
-      this.chat,
-      { video: buffer, caption },
       { quoted: this.raw },
     );
   }
@@ -187,19 +163,15 @@ export default class Message {
     );
   }
 
-  async sendSticker(buffer) {
-    return this.bot.sendSticker(this.chat, buffer, this.raw);
-  }
-
   get mime() {
     return (this.quoted?.msg || this.quoted || this.msg)?.mimetype || "";
   }
 
-  get isMedia() {
-    return /image|video|sticker|audio/.test(this.mime);
+  get senderJids() {
+    return [...new Set([this.sender, this.senderAlt].filter(Boolean))];
   }
 
-  get content() {
-    return JSON.stringify(this.raw.message);
+  isOwner() {
+    return this.senderJids.some((jid) => this.bot.isCreator(jid));
   }
 }

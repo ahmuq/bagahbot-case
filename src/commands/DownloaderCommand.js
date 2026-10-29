@@ -1,4 +1,17 @@
-import { fetchJson } from "../utils/helpers.js";
+import Helpers from "../utils/helpers.js";
+
+const isHttpUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+const assertUrl = (value, example) => {
+  if (!value || !isHttpUrl(value)) throw `Example : ${example}`;
+};
 
 export default class DownloaderCommand {
   constructor(bot) {
@@ -32,42 +45,32 @@ export default class DownloaderCommand {
     ]);
   }
 
-  #requireUrl(text, example) {
-    if (!text) throw `Example : ${example}`;
-  }
-
   async couple(msg) {
-    const data = await fetchJson(
+    const data = await Helpers.fetchJson(
       "https://raw.githubusercontent.com/iamriz7/kopel_/main/kopel.json",
     );
+    if (!Array.isArray(data) || !data.length) {
+      throw "Gagal mengambil data couple";
+    }
+
     const random = data[Math.floor(Math.random() * data.length)];
+    if (!random?.male || !random?.female) {
+      throw "Data couple tidak valid";
+    }
 
-    await this.bot.sock.sendMessage(
-      msg.chat,
-      {
-        image: { url: random.male },
-        caption: "Couple Male",
-      },
-      { quoted: msg.raw },
-    );
-
-    await this.bot.sock.sendMessage(
-      msg.chat,
-      {
-        image: { url: random.female },
-        caption: "Couple Female",
-      },
-      { quoted: msg.raw },
-    );
+    await this.#sendMedia(msg, random.male, "image", "Couple Male");
+    await this.#sendMedia(msg, random.female, "image", "Couple Female");
   }
 
   async tiktokNwm(msg, { text }) {
-    this.#requireUrl(text, "!ttnwm https://vt.tiktok.com/ZSwWCk5o/");
+    assertUrl(text, "!ttnwm https://vt.tiktok.com/ZSwWCk5o/");
     await msg.reply("Waiting...");
 
-    const json = await fetchJson(
-      `https://api.tiklydown.eu.org/api/download?url=${text}`,
-    );
+    const url = `https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(text)}`;
+    const json = await Helpers.fetchJson(url);
+    const videoUrl = json?.video?.noWatermark;
+
+    if (!videoUrl) throw "Gagal mengambil video TikTok";
 
     const caption = [
       `⭔ ID : ${json?.id}`,
@@ -81,18 +84,11 @@ export default class DownloaderCommand {
       `⭔ Audio : ${json?.music?.title} - ${json?.music?.author}`,
     ].join("\n");
 
-    await this.bot.sock.sendMessage(
-      msg.chat,
-      {
-        video: { url: json?.video?.noWatermark },
-        caption,
-      },
-      { quoted: msg.raw },
-    );
+    await this.#sendMedia(msg, videoUrl, "video", caption);
   }
 
   async facebook(msg, { text }) {
-    this.#requireUrl(text, "!fbdl https://www.facebook.com/...");
+    assertUrl(text, "!fbdl https://www.facebook.com/...");
     await msg.reply(this.bot.config.messages.wait);
 
     const result = await this.bot.api.facebookDownload(text);
@@ -105,54 +101,36 @@ export default class DownloaderCommand {
       .filter(Boolean)
       .join("\n");
 
-    await this.bot.sock.sendMessage(
-      msg.chat,
-      {
-        video: { url: result.url },
-        caption,
-      },
-      { quoted: msg.raw },
-    );
+    await this.#sendMedia(msg, result.url, "video", caption);
   }
 
   async instagram(msg, { text }) {
-    this.#requireUrl(text, "!igdl https://www.instagram.com/p/xxx");
+    assertUrl(text, "!igdl https://www.instagram.com/p/xxx");
     await msg.reply(this.bot.config.messages.wait);
 
     const media = await this.bot.api.instagramDownload(text);
-
-    for (let i = 0; i < media.length; i++) {
-      const item = media[i];
-      const caption = media.length > 1 ? `Media ${i + 1}/${media.length}` : "";
-
-      if (item.type === "mp4") {
-        await this.bot.sock.sendMessage(
-          msg.chat,
-          { video: { url: item.url }, caption },
-          { quoted: msg.raw },
-        );
-      } else {
-        await this.bot.sock.sendMessage(
-          msg.chat,
-          { image: { url: item.url }, caption },
-          { quoted: msg.raw },
-        );
-      }
-    }
+    await this.#sendMediaItems(
+      msg,
+      media,
+      (item) => (item.type === "mp4" ? "video" : "image"),
+      "Media",
+    );
   }
 
   async igStory(msg, { text }) {
-    if (!text)
+    if (!text) {
       throw "Masukkan username Instagram\nContoh : !igstory kennyxepher";
+    }
+
     const username = text.replace(/^@/, "");
     await msg.reply(this.bot.config.messages.wait);
 
     const { user, stories } = await this.bot.api.igStory(username);
-
     if (!stories.length) throw `Tidak ada story dari @${username}`;
 
     const profile = [
-      `📱 *Instagram Story*\n`,
+      "📱 *Instagram Story*",
+      "",
       `Username  : @${user.username}`,
       `Name      : ${user.fullName}`,
       `Followers : ${user.followers}`,
@@ -162,47 +140,46 @@ export default class DownloaderCommand {
     ].join("\n");
 
     await msg.reply(profile);
-
-    for (let i = 0; i < stories.length; i++) {
-      const item = stories[i];
-      const caption =
-        stories.length > 1 ? `Story ${i + 1}/${stories.length}` : "";
-
-      if (item.type === "video") {
-        await this.bot.sock.sendMessage(
-          msg.chat,
-          { video: { url: item.url }, caption },
-          { quoted: msg.raw },
-        );
-      } else {
-        await this.bot.sock.sendMessage(
-          msg.chat,
-          { image: { url: item.url }, caption },
-          { quoted: msg.raw },
-        );
-      }
-    }
+    await this.#sendMediaItems(
+      msg,
+      stories,
+      (item) => (item.type === "video" ? "video" : "image"),
+      "Story",
+    );
   }
 
   async tiktokAudio(msg, { text }) {
-    this.#requireUrl(text, "!ttmp3 https://vt.tiktok.com/ZS82urPBa/");
+    assertUrl(text, "!ttmp3 https://vt.tiktok.com/ZS82urPBa/");
     if (!text.includes("tiktok.com")) throw "Error Link";
 
-    try {
-      const json = await fetchJson(
-        `https://api.tiklydown.me/api/download?url=${text}`,
-      );
+    const url = `https://api.tiklydown.me/api/download?url=${encodeURIComponent(text)}`;
+    const json = await Helpers.fetchJson(url);
+    const audioUrl = json?.music?.play_url;
 
-      await this.bot.sock.sendMessage(
-        msg.chat,
-        {
-          audio: { url: json?.music?.play_url },
-          mimetype: "audio/mp4",
-        },
-        { quoted: msg.raw },
-      );
-    } catch {
-      throw "Maaf Kak Fitur Sedang Error";
+    if (!audioUrl) throw "Maaf Kak Fitur Sedang Error";
+
+    await this.bot.sock.sendMessage(
+      msg.chat,
+      { audio: { url: audioUrl }, mimetype: "audio/mp4" },
+      { quoted: msg.raw },
+    );
+  }
+
+  async #sendMediaItems(msg, items, getType, label) {
+    for (const [index, item] of items.entries()) {
+      const caption =
+        items.length > 1 ? `${label} ${index + 1}/${items.length}` : "";
+      await this.#sendMedia(msg, item.url, getType(item), caption);
     }
+  }
+
+  async #sendMedia(msg, url, type, caption = "") {
+    if (!url) throw "Media URL tidak ditemukan";
+
+    await this.bot.sock.sendMessage(
+      msg.chat,
+      { [type]: { url }, caption },
+      { quoted: msg.raw },
+    );
   }
 }
